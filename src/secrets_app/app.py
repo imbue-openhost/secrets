@@ -1,42 +1,39 @@
 import json
 import re
 from contextlib import closing
+from pathlib import Path
 
-from secrets_app.db import get_db
-from secrets_app.db import init_db
-from quart import Quart
-from quart import jsonify
-from quart import request
+from litestar import Litestar, Request, Response, delete, get, post
+from litestar.contrib.jinja import JinjaTemplateEngine
+from litestar.exceptions import HTTPException
+from litestar.response import Template
+from litestar.status_codes import HTTP_400_BAD_REQUEST, HTTP_403_FORBIDDEN
+from litestar.template.config import TemplateConfig
 
-app = Quart(__name__)
-
-init_db()
+from secrets_app.db import get_db, init_db
 
 
 # ─── Owner Dashboard ───
 
 
-@app.route("/")
-async def index():
-    from quart import render_template  # noqa: PLC0415
-
+@get("/", sync_to_thread=True)
+def index() -> Template:
     with closing(get_db()) as db:
-        secrets = db.execute("SELECT * FROM secrets ORDER BY key").fetchall()
-    return await render_template("index.html", secrets=secrets)
+        secrets = [dict(r) for r in db.execute("SELECT * FROM secrets ORDER BY key").fetchall()]
+    return Template(template_name="index.html", context={"secrets": secrets})
 
 
-@app.route("/api/secrets", methods=["GET"])
-async def list_secrets():
+@get("/api/secrets", sync_to_thread=True)
+def list_secrets() -> list[dict]:
     with closing(get_db()) as db:
         rows = db.execute("SELECT key, description, created_at, updated_at FROM secrets ORDER BY key").fetchall()
-    return jsonify([dict(r) for r in rows])
+    return [dict(r) for r in rows]
 
 
-@app.route("/api/secrets", methods=["POST"])
-async def set_secret():
-    data = await request.get_json()
-    if not data or not data.get("key") or "value" not in data:
-        return jsonify({"error": "key and value are required"}), 400
+@post("/api/secrets", sync_to_thread=True)
+def set_secret(data: dict) -> dict:
+    if not data.get("key") or "value" not in data:
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="key and value are required")
     with closing(get_db()) as db:
         db.execute(
             """INSERT INTO secrets (key, value, description)
@@ -48,19 +45,19 @@ async def set_secret():
             (data["key"], data["value"], data.get("description", "")),
         )
         db.commit()
-    return jsonify({"ok": True})
+    return {"ok": True}
 
 
-@app.route("/api/secrets/<key>", methods=["DELETE"])
-async def delete_secret(key):
+@delete("/api/secrets/{key:str}", status_code=200, sync_to_thread=True)
+def delete_secret(key: str) -> dict:
     with closing(get_db()) as db:
         db.execute("DELETE FROM secrets WHERE key = ?", (key,))
         db.commit()
-    return jsonify({"ok": True})
+    return {"ok": True}
 
 
-@app.route("/api/import", methods=["POST"])
-async def import_secrets():
+@post("/api/import", sync_to_thread=True)
+def import_secrets(data: dict) -> dict:
     """Import secrets from a shell-style env file.
 
     Parses lines like:
@@ -70,9 +67,8 @@ async def import_secrets():
         KEY=value
     Skips comments (#) and blank lines. Upserts all parsed key-value pairs.
     """
-    data = await request.get_json()
-    if not data or "content" not in data:
-        return jsonify({"error": "content is required"}), 400
+    if "content" not in data:
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="content is required")
 
     parsed = _parse_env_file(data["content"])
     description = data.get("description", "")
@@ -94,7 +90,7 @@ async def import_secrets():
             )
             imported += 1
         db.commit()
-    return jsonify({"ok": True, "imported": imported, "skipped": skipped})
+    return {"ok": True, "imported": imported, "skipped": skipped}
 
 
 def _parse_env_file(content):
@@ -120,14 +116,13 @@ def _parse_env_file(content):
 # ─── Service API (called by other apps via router) ───
 
 
-@app.route("/_service/get", methods=["POST"])
-async def service_get():
+@post("/_service/get", sync_to_thread=True)
+def service_get(data: dict) -> dict:
     """Return secret values for the requested keys."""
-    data = await request.get_json()
-    requested_keys = data.get("keys", []) if data else []
+    requested_keys = data.get("keys", [])
 
     if not requested_keys:
-        return jsonify({"error": "No keys requested"}), 400
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="No keys requested")
 
     with closing(get_db()) as db:
         result = {}
@@ -137,27 +132,27 @@ async def service_get():
                 result[key] = row["value"]
 
     missing = [k for k in requested_keys if k not in result]
-    response = {"secrets": result}
+    response: dict = {"secrets": result}
     if missing:
         response["missing"] = missing
         response["message"] = (
             f"The following secrets are not set: {', '.join(missing)}. Add them in the secrets app dashboard."
         )
-    return jsonify(response)
+    return response
 
 
-@app.route("/_service/list", methods=["GET"])
-async def service_list():
+@get("/_service/list", sync_to_thread=True)
+def service_list() -> dict:
     """List available secret keys (names only, not values)."""
     with closing(get_db()) as db:
         rows = db.execute("SELECT key, description FROM secrets ORDER BY key").fetchall()
-    return jsonify({"keys": [{"key": r["key"], "description": r["description"]} for r in rows]})
+    return {"keys": [{"key": r["key"], "description": r["description"]} for r in rows]}
 
 
 # ─── V2 Service API (secrets — permissions validated by provider) ───
 
 
-def _parse_v2_grants() -> tuple[set[str], bool]:
+def _parse_v2_grants(request: Request) -> tuple[set[str], bool]:
     """Read X-OpenHost-Permissions header and return (granted_keys, grant_all)."""
     perms_header = request.headers.get("X-OpenHost-Permissions", "[]")
     try:
@@ -176,27 +171,25 @@ def _parse_v2_grants() -> tuple[set[str], bool]:
     return granted_keys, False
 
 
-@app.route("/_service_v2/get", methods=["POST"])
-async def service_v2_get():
+@post("/_service_v2/get", sync_to_thread=True)
+def service_v2_get(data: dict, request: Request) -> Response:
     """Return secret values for the requested keys (V2: provider-side permission check)."""
-    data = await request.get_json()
-    requested_keys = data.get("keys", []) if data else []
+    requested_keys = data.get("keys", [])
 
     if not requested_keys:
-        return jsonify({"error": "No keys requested"}), 400
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="No keys requested")
 
-    granted_keys, grant_all = _parse_v2_grants()
+    granted_keys, grant_all = _parse_v2_grants(request)
     if not grant_all:
         missing_perms = [k for k in requested_keys if k not in granted_keys]
         if missing_perms:
-            return jsonify(
-                {
+            return Response(
+                content={
                     "error": "permission_required",
-                    "required_grant": {
-                        "grant": {"key": missing_perms[0]},
-                    },
-                }
-            ), 403
+                    "required_grant": {"grant": {"key": missing_perms[0]}},
+                },
+                status_code=HTTP_403_FORBIDDEN,
+            )
 
     with closing(get_db()) as db:
         result = {}
@@ -206,15 +199,35 @@ async def service_v2_get():
                 result[key] = row["value"]
 
     missing = [k for k in requested_keys if k not in result]
-    response = {"secrets": result}
+    body: dict = {"secrets": result}
     if missing:
-        response["missing"] = missing
-    return jsonify(response)
+        body["missing"] = missing
+    return Response(content=body)
 
 
-@app.route("/_service_v2/list", methods=["GET"])
-async def service_v2_list():
+@get("/_service_v2/list", sync_to_thread=True)
+def service_v2_list() -> dict:
     """List available secret keys (V2: no permission check needed for names)."""
     with closing(get_db()) as db:
         rows = db.execute("SELECT key, description FROM secrets ORDER BY key").fetchall()
-    return jsonify({"keys": [{"key": r["key"], "description": r["description"]} for r in rows]})
+    return {"keys": [{"key": r["key"], "description": r["description"]} for r in rows]}
+
+
+app = Litestar(
+    route_handlers=[
+        index,
+        list_secrets,
+        set_secret,
+        delete_secret,
+        import_secrets,
+        service_get,
+        service_list,
+        service_v2_get,
+        service_v2_list,
+    ],
+    template_config=TemplateConfig(
+        directory=Path(__file__).parent / "templates",
+        engine=JinjaTemplateEngine,
+    ),
+    on_startup=[lambda _app: init_db()],
+)
