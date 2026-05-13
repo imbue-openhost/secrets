@@ -24,6 +24,24 @@ def test_set_and_list_secret(stack: OpenhostStack) -> None:
     assert "TEST_KEY" in keys
 
 
+def test_export_round_trips_through_import(stack: OpenhostStack) -> None:
+    """Values with shell metacharacters must survive an export -> import round trip."""
+    tricky = "needs 'quotes' & $shell stuff"
+    httpx.post(f"{stack.url}/api/secrets", json={"key": "TRICKY", "value": tricky})
+
+    exported = httpx.get(f"{stack.url}/api/export")
+    assert exported.status_code == 200
+    assert exported.headers["content-type"].startswith("text/plain")
+    assert "secrets.env" in exported.headers.get("content-disposition", "")
+    assert "export TRICKY=" in exported.text
+
+    httpx.delete(f"{stack.url}/api/secrets/TRICKY")
+    httpx.post(f"{stack.url}/api/import", json={"content": exported.text})
+
+    listed = httpx.get(f"{stack.url}/api/secrets").json()
+    assert any(row["key"] == "TRICKY" for row in listed)
+
+
 def test_v2_service_requires_grant(stack: OpenhostStack) -> None:
     """Direct service call without grants should be rejected."""
     r = httpx.post(

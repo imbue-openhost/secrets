@@ -1,5 +1,6 @@
 import json
 import re
+import shlex
 from contextlib import closing
 from pathlib import Path
 
@@ -93,6 +94,19 @@ def import_secrets(data: dict) -> dict:
     return {"ok": True, "imported": imported, "skipped": skipped}
 
 
+@get("/api/export", sync_to_thread=True, media_type="text/plain")
+def export_secrets() -> Response:
+    """Render all secrets as a shell-style env file (for download)."""
+    with closing(get_db()) as db:
+        rows = db.execute("SELECT key, value FROM secrets ORDER BY key").fetchall()
+    body = "".join(f"export {r['key']}={shlex.quote(r['value'])}\n" for r in rows)
+    return Response(
+        content=body,
+        media_type="text/plain",
+        headers={"Content-Disposition": 'attachment; filename="secrets.env"'},
+    )
+
+
 def _parse_env_file(content):
     """Parse shell-style env file. Returns list of (key, value) tuples."""
     results = []
@@ -111,42 +125,6 @@ def _parse_env_file(content):
             value = value[1:-1]
         results.append((key, value))
     return results
-
-
-# ─── Service API (called by other apps via router) ───
-
-
-@post("/_service/get", sync_to_thread=True)
-def service_get(data: dict) -> dict:
-    """Return secret values for the requested keys."""
-    requested_keys = data.get("keys", [])
-
-    if not requested_keys:
-        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="No keys requested")
-
-    with closing(get_db()) as db:
-        result = {}
-        for key in requested_keys:
-            row = db.execute("SELECT value FROM secrets WHERE key = ?", (key,)).fetchone()
-            if row:
-                result[key] = row["value"]
-
-    missing = [k for k in requested_keys if k not in result]
-    response: dict = {"secrets": result}
-    if missing:
-        response["missing"] = missing
-        response["message"] = (
-            f"The following secrets are not set: {', '.join(missing)}. Add them in the secrets app dashboard."
-        )
-    return response
-
-
-@get("/_service/list", sync_to_thread=True)
-def service_list() -> dict:
-    """List available secret keys (names only, not values)."""
-    with closing(get_db()) as db:
-        rows = db.execute("SELECT key, description FROM secrets ORDER BY key").fetchall()
-    return {"keys": [{"key": r["key"], "description": r["description"]} for r in rows]}
 
 
 # ─── V2 Service API (secrets — permissions validated by provider) ───
@@ -220,8 +198,7 @@ app = Litestar(
         set_secret,
         delete_secret,
         import_secrets,
-        service_get,
-        service_list,
+        export_secrets,
         service_v2_get,
         service_v2_list,
     ],
