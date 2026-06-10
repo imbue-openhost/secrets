@@ -149,7 +149,7 @@ def _parse_v2_grants(request: Request) -> tuple[set[str], bool]:
     return granted_keys, False
 
 
-@post("/_service_v2/get", sync_to_thread=True)
+@post("/_service_v2/get", status_code=200, sync_to_thread=True)
 def service_v2_get(data: dict, request: Request) -> Response:
     """Return secret values for the requested keys (V2: provider-side permission check)."""
     requested_keys = data.get("keys", [])
