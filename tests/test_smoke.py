@@ -65,5 +65,5 @@ def test_v2_service_with_grant(stack: OpenhostStack) -> None:
         json={"keys": ["GRANTED_KEY"]},
         headers={"X-OpenHost-Permissions": '[{"grant":{"key":"GRANTED_KEY"}}]'},
     )
-    assert r.status_code == 201  # Litestar @post default; may want to pin to 200 later
+    assert r.status_code == 200
     assert r.json() == {"secrets": {"GRANTED_KEY": "shh"}}
