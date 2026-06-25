@@ -130,23 +130,38 @@ def _parse_env_file(content):
 # ─── V2 Service API (secrets — permissions validated by provider) ───
 
 
-def _parse_v2_grants(request: Request) -> tuple[set[str], bool]:
-    """Read X-OpenHost-Permissions header and return (granted_keys, grant_all)."""
+def _parse_v2_grants(request: Request) -> tuple[set[str], set[str], bool]:
+    """Read X-OpenHost-Permissions header and return (granted_keys, granted_prefixes, grant_all).
+
+    Grant payload shapes (defined by this service; the router forwards them verbatim):
+      - {"key": "<NAME>"}      grants exactly that key
+      - {"key": "*"}           grants every key (grant_all)
+      - {"key_prefix": "<P>"}  grants every key whose name starts with <P>
+    """
     perms_header = request.headers.get("X-OpenHost-Permissions", "[]")
     try:
         grants = json.loads(perms_header)
     except json.JSONDecodeError:
-        return set(), False
+        return set(), set(), False
 
     granted_keys: set[str] = set()
+    granted_prefixes: set[str] = set()
     for g in grants:
         payload = g.get("grant", {})
         if isinstance(payload, dict):
             if payload.get("key") == "*":
-                return set(), True
+                return set(), set(), True
             if "key" in payload:
                 granted_keys.add(payload["key"])
-    return granted_keys, False
+            # Ignore an empty prefix so it can't accidentally grant everything.
+            if payload.get("key_prefix"):
+                granted_prefixes.add(payload["key_prefix"])
+    return granted_keys, granted_prefixes, False
+
+
+def _key_is_granted(key: str, granted_keys: set[str], granted_prefixes: set[str]) -> bool:
+    """A key is accessible if it was granted exactly or matches a granted prefix."""
+    return key in granted_keys or any(key.startswith(p) for p in granted_prefixes)
 
 
 @post("/_service_v2/get", status_code=200, sync_to_thread=True)
@@ -157,9 +172,11 @@ def service_v2_get(data: dict, request: Request) -> Response:
     if not requested_keys:
         raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="No keys requested")
 
-    granted_keys, grant_all = _parse_v2_grants(request)
+    granted_keys, granted_prefixes, grant_all = _parse_v2_grants(request)
     if not grant_all:
-        missing_perms = [k for k in requested_keys if k not in granted_keys]
+        missing_perms = [
+            k for k in requested_keys if not _key_is_granted(k, granted_keys, granted_prefixes)
+        ]
         if missing_perms:
             return Response(
                 content={
